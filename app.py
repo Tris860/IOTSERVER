@@ -6,6 +6,7 @@ from typing import Dict, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import JSONResponse
 
+
 # Create FastAPI app
 app = FastAPI()
 
@@ -82,6 +83,28 @@ async def ws_browser(websocket: WebSocket):
         pass
     finally:
         browsers.discard(websocket)
+
+
+@app.post("/command")
+async def receive_command(request: Request):
+    data = await request.json()
+    command = data.get("command")
+    source = data.get("source", "unknown")
+
+    print(f"[{time.strftime('%H:%M:%S')}] Received command from {source}: {command}")
+
+    # Broadcast to all connected devices
+    for deviceId, ws in devices.items():
+        try:
+            await ws.send_text(json.dumps({
+                "type": "command",
+                "payload": { "action": command }
+            }))
+        except Exception as e:
+            print(f"Failed to send to {deviceId}: {e}")
+
+    return { "status": "ok", "message": f"Command '{command}' broadcasted to devices." }
+
 
 async def notify_browsers(event: dict):
     """Broadcast events to all connected browsers"""
