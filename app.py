@@ -1,84 +1,102 @@
-from flask import Flask, request, jsonify
-from datetime import datetime
-import time
+# app.py
 import os
+import json
+import time
+from typing import Dict, Set
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import JSONResponse
 
-# --- Configuration ---
-# Bind to 0.0.0.0 for public access (required by deployment platforms like Render)
-HOST = "0.0.0.0"
-# Use the PORT environment variable provided by the platform (default to 5000 for local dev)
-PORT = int(os.environ.get("PORT", 5000))
+# Create FastAPI app
+app = FastAPI()
 
-# Create the Flask application instance
-app = Flask(__name__)
+# Track connected devices and browsers
+devices: Dict[str, WebSocket] = {}
+browsers: Set[WebSocket] = set()
+last_ping: Dict[str, float] = {}
 
-# --- Wemos Device Simulation ---
-def send_to_wemos(command: str):
-    """
-    Simulates sending data to the dedicated IoT device (Wemos).
-    In a real system, this function would handle the low-level communication (e.g., MQTT, TCP/UDP).
-    """
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] -> Wemos: Processing command '{command}'...")
-    
-    # Simulate different processing times based on command type
-    if command in ["HARD_ON", "HARD_OFF"]:
-        time.sleep(0.05) # Fast response for critical controls
-    elif command == "AUTO_OFF":
-        time.sleep(0.5) # Slower response for mode changes
-    
-    # Generate simulated Wemos response
-    if command == "HARD_ON":
-        return f"Wemos: Successfully set GPIO high."
-    elif command == "HARD_OFF":
-        return f"Wemos: Successfully set GPIO low."
-    elif command == "AUTO_OFF":
-        return f"Wemos: Switched internal state to automatic management."
-    else:
-        return f"Wemos: Unknown command '{command}'."
+@app.get("/")
+def root():
+    return JSONResponse({"status": "ok", "message": "WebSocket gateway online"})
 
+@app.websocket("/ws/device")
+async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
+    """WebSocket endpoint for Wemos/IoT devices"""
+    await websocket.accept()
+    devices[deviceId] = websocket
+    last_ping[deviceId] = time.time()
+    await notify_browsers({"type": "device_connected", "deviceId": deviceId})
 
-@app.route('/command', methods=['POST'])
-def receive_command():
-    """
-    Receives command requests from Server A (Command Forwarder).
-    """
-    if not request.is_json:
-        return jsonify({"status": "error", "message": "Content-Type must be application/json"}), 400
-
-    data = request.get_json()
-    command = data.get('command')
-    source = data.get('source', 'ServerA') # Default to ServerA, as it is the expected source
-    
-    if not command:
-        return jsonify({"status": "error", "message": "Missing 'command' field in JSON payload"}), 400
-
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] **Received Command from {source}: '{command}'**")
-    
-    # Execute the command simulation
-    wemos_response = send_to_wemos(command)
-    
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Wemos Simulation Result: {wemos_response}")
-
-    # Send success response back to Server A
-    return jsonify({
-        "status": "success",
-        "command_received": command,
-        "wemos_status": wemos_response,
-        "timestamp": datetime.now().isoformat()
-    }), 200
-
-# --- Local Run Block and Deployment Reference ---
-if __name__ == '__main__':
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Server B (IoT Gateway) for local development on http://{HOST}:{PORT}")
-    print("---")
-    print("Render Deployment Start Command (for web service configuration):")
-    print("gunicorn --bind 0.0.0.0:$PORT app:app")
-    print("---")
-    
-    # Run the Flask app directly for local development compatibility
     try:
-        app.run(host=HOST, port=PORT, debug=False) 
-    except KeyboardInterrupt:
-        print("\nServer B stopped by user.")
-    except Exception as e:
-        print(f"An error occurred during server startup: {e}")
+        while True:
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+
+            # Heartbeat
+            if data.get("type") == "ping":
+                last_ping[deviceId] = time.time()
+                await websocket.send_text(json.dumps({"type": "pong"}))
+                continue
+
+            # Status update from device -> broadcast to browsers
+            await notify_browsers({
+                "type": "device_status",
+                "deviceId": deviceId,
+                "payload": data
+            })
+    except WebSocketDisconnect:
+        pass
+    finally:
+        devices.pop(deviceId, None)
+        last_ping.pop(deviceId, None)
+        await notify_browsers({"type": "device_disconnected", "deviceId": deviceId})
+
+@app.websocket("/ws/browser")
+async def ws_browser(websocket: WebSocket):
+    """WebSocket endpoint for browser clients"""
+    await websocket.accept()
+    browsers.add(websocket)
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+
+            # Browser sends command to device
+            if data.get("type") == "command":
+                target = data.get("deviceId")
+                payload = data.get("payload", {})
+                if target in devices:
+                    await devices[target].send_text(json.dumps({
+                        "type": "command",
+                        "payload": payload
+                    }))
+                    await websocket.send_text(json.dumps({
+                        "type": "ack",
+                        "deviceId": target
+                    }))
+                else:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "device offline"
+                    }))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        browsers.discard(websocket)
+
+async def notify_browsers(event: dict):
+    """Broadcast events to all connected browsers"""
+    dead = []
+    message = json.dumps(event)
+    for ws in list(browsers):
+        try:
+            await ws.send_text(message)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        browsers.discard(ws)
+
+# --- Local run block ---
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 5000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
