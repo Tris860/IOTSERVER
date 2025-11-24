@@ -1,12 +1,9 @@
-# app.py
 import os
 import json
 import time
 from typing import Dict, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Request
-
 from fastapi.responses import JSONResponse
-
 
 # Create FastAPI app
 app = FastAPI()
@@ -85,27 +82,55 @@ async def ws_browser(websocket: WebSocket):
     finally:
         browsers.discard(websocket)
 
-
 @app.post("/command")
 async def receive_command(request: Request):
+    """Receive command from Server A and forward to devices"""
     data = await request.json()
     command = data.get("command")
     source = data.get("source", "unknown")
+    target = data.get("deviceId")  # optional
 
     print(f"[{time.strftime('%H:%M:%S')}] Received command from {source}: {command}")
 
-    # Broadcast to all connected devices
-    for deviceId, ws in devices.items():
-        try:
-            await ws.send_text(json.dumps({
-                "type": "command",
-                "payload": { "action": command }
-            }))
-        except Exception as e:
-            print(f"Failed to send to {deviceId}: {e}")
+    if target:
+        # Send only to the specified device
+        ws = devices.get(target)
+        if ws:
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "command",
+                    "payload": { "action": command }
+                }))
+                await notify_browsers({
+                    "type": "server_command",
+                    "source": source,
+                    "command": command,
+                    "target": target
+                })
+                return { "status": "ok", "message": f"Command '{command}' sent to {target}." }
+            except Exception as e:
+                return { "status": "error", "message": f"Failed to send to {target}: {e}" }
+        else:
+            return { "status": "error", "message": f"Device {target} not connected." }
+    else:
+        # Broadcast to all devices
+        for deviceId, ws in devices.items():
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "command",
+                    "payload": { "action": command }
+                }))
+            except Exception as e:
+                print(f"Failed to send to {deviceId}: {e}")
 
-    return { "status": "ok", "message": f"Command '{command}' broadcasted to devices." }
+        await notify_browsers({
+            "type": "server_command",
+            "source": source,
+            "command": command,
+            "target": "all"
+        })
 
+        return { "status": "ok", "message": f"Command '{command}' broadcasted to all devices." }
 
 async def notify_browsers(event: dict):
     """Broadcast events to all connected browsers"""
