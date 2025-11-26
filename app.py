@@ -1,17 +1,18 @@
 import os
 import json
 import time
+import requests
 from typing import Dict, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.responses import JSONResponse
 
-# Create FastAPI app
 app = FastAPI()
 
-# Track connected devices and browsers
 devices: Dict[str, WebSocket] = {}
 browsers: Set[WebSocket] = set()
 last_ping: Dict[str, float] = {}
+
+WEMOS_AUTH_URL = "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=wemos_auth"
 
 @app.get("/")
 def root():
@@ -19,47 +20,91 @@ def root():
 
 @app.websocket("/ws/device")
 async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
-    """WebSocket endpoint for Wemos/IoT devices"""
-    await websocket.accept()
-    devices[deviceId] = websocket
-    last_ping[deviceId] = time.time()
-    await notify_browsers({"type": "device_connected", "deviceId": deviceId})
+    """
+    WebSocket endpoint for Wemos/IoT devices with authentication.
+    Devices must send x-username and x-password headers.
+    """
+    # Extract headers
+    username = websocket.headers.get("x-username")
+    password = websocket.headers.get("x-password")
+    print(f"Authenticating Wemos. username={username}")
 
+    if not username or not password:
+        await websocket.close(code=4000)
+        print("Authentication failed: missing headers")
+        return
+
+    # Call PHP backend for authentication
     try:
-        while True:
-            msg = await websocket.receive_text()
-            data = json.loads(msg)
+        resp = requests.post(
+            WEMOS_AUTH_URL,
+            data={
+                "action": "wemos_auth",
+                "username": username,
+                "password": password,
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            await websocket.close(code=4001)
+            print("Authentication failed: backend error")
+            return
 
-            # Heartbeat
-            if data.get("type") == "ping":
-                last_ping[deviceId] = time.time()
-                await websocket.send_text(json.dumps({"type": "pong"}))
-                continue
+        data = resp.json()
+        if not data.get("success"):
+            await websocket.close(code=4002)
+            print(f"Authentication failed: {data.get('message')}")
+            return
 
-            # Status update from device -> broadcast to browsers
-            await notify_browsers({
-                "type": "device_status",
-                "deviceId": deviceId,
-                "payload": data
-            })
-    except WebSocketDisconnect:
-        pass
-    finally:
-        devices.pop(deviceId, None)
-        last_ping.pop(deviceId, None)
-        await notify_browsers({"type": "device_disconnected", "deviceId": deviceId})
+        # Device authenticated
+        deviceName = data.get("data", {}).get("device_name", username)
+        initialCommand = "HARD_ON" if data.get("data", {}).get("hard_switch_enabled") else "HARD_OFF"
+
+        await websocket.accept()
+        devices[deviceName] = websocket
+        last_ping[deviceName] = time.time()
+        print(f"Wemos '{deviceName}' authenticated and connected.")
+
+        # Send initial command if any
+        await websocket.send_text(json.dumps({"type": "command", "payload": {"action": initialCommand}}))
+
+        await notify_browsers({"type": "device_connected", "deviceId": deviceName})
+
+        try:
+            while True:
+                msg = await websocket.receive_text()
+                data = json.loads(msg)
+
+                if data.get("type") == "ping":
+                    last_ping[deviceName] = time.time()
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                    continue
+
+                await notify_browsers({
+                    "type": "device_status",
+                    "deviceId": deviceName,
+                    "payload": data
+                })
+        except WebSocketDisconnect:
+            pass
+        finally:
+            devices.pop(deviceName, None)
+            last_ping.pop(deviceName, None)
+            await notify_browsers({"type": "device_disconnected", "deviceId": deviceName})
+
+    except Exception as e:
+        print(f"Authentication error: {e}")
+        await websocket.close(code=1011)  # Internal error
+        return
 
 @app.websocket("/ws/browser")
 async def ws_browser(websocket: WebSocket):
-    """WebSocket endpoint for browser clients"""
     await websocket.accept()
     browsers.add(websocket)
     try:
         while True:
             msg = await websocket.receive_text()
             data = json.loads(msg)
-
-            # Browser sends command to device
             if data.get("type") == "command":
                 target = data.get("deviceId")
                 payload = data.get("payload", {})
@@ -84,22 +129,20 @@ async def ws_browser(websocket: WebSocket):
 
 @app.post("/command")
 async def receive_command(request: Request):
-    """Receive command from Server A and forward to devices"""
     data = await request.json()
     command = data.get("command")
     source = data.get("source", "unknown")
-    target = data.get("deviceId")  # optional
+    target = data.get("deviceId")
 
     print(f"[{time.strftime('%H:%M:%S')}] Received command from {source}: {command}")
 
     if target:
-        # Send only to the specified device
         ws = devices.get(target)
         if ws:
             try:
                 await ws.send_text(json.dumps({
                     "type": "command",
-                    "payload": { "action": command }
+                    "payload": {"action": command}
                 }))
                 await notify_browsers({
                     "type": "server_command",
@@ -107,18 +150,17 @@ async def receive_command(request: Request):
                     "command": command,
                     "target": target
                 })
-                return { "status": "ok", "message": f"Command '{command}' sent to {target}." }
+                return {"status": "ok", "message": f"Command '{command}' sent to {target}."}
             except Exception as e:
-                return { "status": "error", "message": f"Failed to send to {target}: {e}" }
+                return {"status": "error", "message": f"Failed to send to {target}: {e}"}
         else:
-            return { "status": "error", "message": f"Device {target} not connected." }
+            return {"status": "error", "message": f"Device {target} not connected."}
     else:
-        # Broadcast to all devices
         for deviceId, ws in devices.items():
             try:
                 await ws.send_text(json.dumps({
                     "type": "command",
-                    "payload": { "action": command }
+                    "payload": {"action": command}
                 }))
             except Exception as e:
                 print(f"Failed to send to {deviceId}: {e}")
@@ -129,11 +171,9 @@ async def receive_command(request: Request):
             "command": command,
             "target": "all"
         })
-
-        return { "status": "ok", "message": f"Command '{command}' broadcasted to all devices." }
+        return {"status": "ok", "message": f"Command '{command}' broadcasted to all devices."}
 
 async def notify_browsers(event: dict):
-    """Broadcast events to all connected browsers"""
     dead = []
     message = json.dumps(event)
     for ws in list(browsers):
@@ -144,7 +184,6 @@ async def notify_browsers(event: dict):
     for ws in dead:
         browsers.discard(ws)
 
-# --- Local run block ---
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 5000))
