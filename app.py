@@ -1,170 +1,149 @@
 import os
 import json
-import requests
+import time
 import asyncio
-from datetime import datetime
-from typing import Dict, Set
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+import requests
+from typing import Dict
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.responses import JSONResponse
 
-# --- Configuration ---
 app = FastAPI()
-SERVER_B_URL = os.environ.get("SERVER_B_URL", "https://iot-gateway-89zp.onrender.com/command")
-PHP_BACKEND_PERIOD_URL = "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=is_current_time_in_period"
-PHP_BACKEND_DEVICE_URL = "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=get_user_device"
 
-# --- State ---
-user_to_device: Dict[str, str] = {}          # email → deviceName
-user_clients: Dict[str, Set[WebSocket]] = {} # email → set of browser sockets
+devices: Dict[str, WebSocket] = {}
+last_ping: Dict[str, float] = {}
 
-@app.on_event("startup")
-async def start_php_polling():
-    asyncio.create_task(check_php_backend())
+WEMOS_AUTH_URL = "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=wemos_auth"
+SERVER_A_CALLBACK_URL = os.environ.get("SERVER_A_CALLBACK_URL", "http://server-a:5000/notify/device-status")
+
+PING_TIMEOUT = 180  # 3 minutes
 
 @app.get("/")
-async def root():
-    return {"status": "ok", "message": "Server A running"}
+def root():
+    return JSONResponse({"status": "ok", "message": "Server B online"})
 
-# --- Browser WebSocket registration ---
-@app.websocket("/ws/browser")
-async def ws_browser(websocket: WebSocket, email: str = Query(...)):
-    await websocket.accept()
-    if email not in user_clients:
-        user_clients[email] = set()
-    user_clients[email].add(websocket)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Browser registered for {email}")
+@app.websocket("/ws/device")
+async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
+    username = websocket.headers.get("x-username")
+    password = websocket.headers.get("x-password")
+    print(f"Authenticating Wemos. username={username}")
 
-    # Lookup device for this user
-    device_name = get_device_for_user(email)
-    if device_name:
-        await websocket.send_text(json.dumps({
-            "type": "device_binding",
-            "deviceName": device_name
-        }))
-        # Ask Server B if device is connected
-        status = await check_device_status(device_name)
-        await websocket.send_text(json.dumps({
-            "type": "device_status",
-            "deviceName": device_name,
-            "status": status
-        }))
-    else:
-        await websocket.send_text(json.dumps({
-            "type": "error",
-            "message": "No device bound to this account"
-        }))
+    if not username or not password:
+        await websocket.close(code=4000)
+        print("Authentication failed: missing headers")
+        return
 
     try:
-        while True:
-            msg = await websocket.receive_text()
-            data = json.loads(msg)
-            if data.get("type") == "command":
-                target_device = user_to_device.get(email)
-                if target_device:
-                    resp = await forward_command(data.get("payload", {}).get("action", ""), target_device)
-                    await websocket.send_text(json.dumps({
-                        "type": "ack",
-                        "deviceId": target_device,
-                        "response": resp
-                    }))
-                else:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "No device bound to your account"
-                    }))
-    except WebSocketDisconnect:
-        pass
-    finally:
-        user_clients[email].discard(websocket)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Browser for {email} disconnected")
-
-# --- Helpers ---
-def get_device_for_user(email: str) -> str | None:
-    if not email:
-        return None
-    if email in user_to_device:
-        return user_to_device[email]
-    try:
-        resp = requests.post(PHP_BACKEND_DEVICE_URL,
-                             data={"action": "get_user_device", "email": email},
+        resp = requests.post(WEMOS_AUTH_URL,
+                             data={"action": "wemos_auth",
+                                   "username": username,
+                                   "password": password},
                              timeout=10)
-        if resp.status_code != 200:
-            return None
+        if resp.status_code != 200 or not resp.json().get("success"):
+            await websocket.close(code=4001)
+            print("Authentication failed")
+            return
+
         data = resp.json()
-        if data.get("success") and data.get("device_name"):
-            device_name = data["device_name"]
-            user_to_device[email] = device_name
-            return device_name
-        return None
-    except Exception as e:
-        print(f"get_device_for_user error: {e}")
-        return None
+        deviceName = data.get("data", {}).get("device_name", username)
+        initialCommand = "HARD_ON" if data.get("data", {}).get("hard_switch_enabled") else "HARD_OFF"
 
-async def forward_command(command: str, target_device: str = None):
-    """Forward command to Server B via HTTP POST."""
-    full_url = SERVER_B_URL if SERVER_B_URL.endswith('/command') else f"{SERVER_B_URL}/command"
-    payload = {"command": command, "source": "ServerA"}
-    if target_device:
-        payload["deviceId"] = target_device
+        await websocket.accept()
+        devices[deviceName] = websocket
+        last_ping[deviceName] = time.time()
+        print(f"Wemos '{deviceName}' connected.")
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Forwarding '{command}' to Server B for {target_device}...")
-    try:
-        response = requests.post(full_url, json=payload, timeout=10)
-        if response.status_code == 200:
-            return f"✅ '{command}' forwarded. Server B replied: {response.text}"
-        else:
-            return f"⚠️ Error: Server B responded with status {response.status_code}."
-    except requests.exceptions.RequestException as e:
-        return f"❌ Failed to connect to Server B. {e.__class__.__name__}"
+        # Send initial command
+        await websocket.send_text(json.dumps({"type": "command", "payload": {"action": initialCommand}}))
 
-async def check_device_status(device_name: str) -> str:
-    """Ask Server B if a device is connected (stub — could be an API call)."""
-    # For now, just forward a status check command
-    resp = await forward_command("STATUS_CHECK", device_name)
-    if "replied" in resp:
-        return "CONNECTED"
-    return "DISCONNECTED"
+        # Notify Server A
+        notify_server_a(deviceName, "CONNECTED")
 
-async def check_php_backend():
-    """Poll PHP backend every minute and forward AUTO_ON when active period is matched."""
-    while True:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Polling PHP backend...")
         try:
-            resp = requests.get(PHP_BACKEND_PERIOD_URL, timeout=10)
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Failed to parse backend response: {resp.text}")
-                    data = None
+            while True:
+                msg = await websocket.receive_text()
+                data = json.loads(msg)
 
-                if data and data.get("success") is True:
-                    backend_msg = data.get("message", "No message")
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ TIME MATCHED: {backend_msg} : {data.get('id')}")
-                    # Forward AUTO_ON to Server B for each bound device
-                    for email, device_name in user_to_device.items():
-                        await forward_command("AUTO_ON", device_name)
-                        # Notify all browser sessions for this user
-                        for ws in list(user_clients.get(email, [])):
-                            try:
-                                await ws.send_text(json.dumps({
-                                    "type": "auto_on_trigger",
-                                    "deviceName": device_name,
-                                    "message": backend_msg
-                                }))
-                            except Exception:
-                                pass
-                else:
-                    backend_msg = data.get("message", "No message") if data else "No data"
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ TIME NOT MATCHED: {backend_msg}")
-            else:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] PHP backend error: HTTP {resp.status_code}")
+                if data.get("type") == "ping":
+                    last_ping[deviceName] = time.time()
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                    continue
+
+                # Forward status to Server A
+                notify_server_a(deviceName, "STATUS", payload=data)
+
+        except WebSocketDisconnect:
+            pass
+        finally:
+            devices.pop(deviceName, None)
+            last_ping.pop(deviceName, None)
+            notify_server_a(deviceName, "DISCONNECTED")
+            print(f"Wemos '{deviceName}' disconnected.")
+
+    except Exception as e:
+        print(f"Authentication error: {e}")
+        await websocket.close(code=1011)
+
+@app.post("/command")
+async def receive_command(request: Request):
+    """Receive command from Server A and forward to devices"""
+    data = await request.json()
+    command = data.get("command")
+    target = data.get("deviceId")
+
+    print(f"[{time.strftime('%H:%M:%S')}] Received command: {command} for {target}")
+
+    if not target:
+        return {"status": "error", "message": "Missing deviceId"}
+
+    if isinstance(target, list):
+        results = {}
+        for dev in target:
+            results[dev] = await send_command_to_device(dev, command)
+        return {"status": "multi", "results": results}
+
+    return await send_command_to_device(target, command)
+
+async def send_command_to_device(deviceName: str, command: str):
+    ws = devices.get(deviceName)
+    if ws:
+        try:
+            await ws.send_text(json.dumps({"type": "command", "payload": {"action": command}}))
+            return {"status": "ok", "message": f"Command '{command}' sent to {deviceName}."}
         except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] check_php_backend error: {e}")
+            return {"status": "error", "message": f"Failed to send to {deviceName}: {e}"}
+    else:
+        return {"status": "error", "message": f"Device {deviceName} not connected."}
 
-        await asyncio.sleep(60)
+def notify_server_a(deviceName: str, status: str, payload: dict = None):
+    """Push device events back to Server A"""
+    event = {"deviceName": deviceName, "status": status}
+    if payload:
+        event["payload"] = payload
+    try:
+        requests.post(SERVER_A_CALLBACK_URL, json=event, timeout=5)
+    except Exception as e:
+        print(f"Failed to notify Server A: {e}")
 
-# --- Local run block ---
+# --- Background task to check ping timeouts ---
+@app.on_event("startup")
+async def monitor_pings():
+    async def check_loop():
+        while True:
+            now = time.time()
+            for deviceName in list(last_ping.keys()):
+                if now - last_ping[deviceName] > PING_TIMEOUT:
+                    print(f"Device {deviceName} timed out (no ping).")
+                    ws = devices.pop(deviceName, None)
+                    last_ping.pop(deviceName, None)
+                    if ws:
+                        try:
+                            await ws.close()
+                        except:
+                            pass
+                    notify_server_a(deviceName, "DISCONNECTED")
+            await asyncio.sleep(30)
+    asyncio.create_task(check_loop())
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 5000))
