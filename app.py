@@ -109,7 +109,11 @@ async def send_command_to_device(deviceName: str, command: str):
             await ws.send_text(json.dumps({"type": "command", "payload": {"action": command}}))
             return {"status": "ok", "message": f"Command '{command}' sent to {deviceName}."}
         except Exception as e:
-            return {"status": "error", "message": f"Failed to send to {deviceName}: {e}"}
+            # Clean up dead socket
+            devices.pop(deviceName, None)
+            last_ping.pop(deviceName, None)
+            print(f"Socket for {deviceName} was closed. Removing from devices.")
+            return {"status": "error", "message": f"Device {deviceName} not connected (socket closed)."}
     else:
         return {"status": "error", "message": f"Device {deviceName} not connected."}
 
