@@ -13,7 +13,7 @@ devices: Dict[str, WebSocket] = {}
 last_ping: Dict[str, float] = {}
 
 WEMOS_AUTH_URL = "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=wemos_auth"
-SERVER_A_CALLBACK_URL = os.environ.get("SERVER_A_CALLBACK_URL", "http://server-a:5000/notify/device-status")
+SERVER_A_CALLBACK_URL = os.environ.get("SERVER_A_CALLBACK_URL", "https://webserver-ft8c.onrender.com/notify/device-status")
 
 PING_TIMEOUT = 180  # 3 minutes
 
