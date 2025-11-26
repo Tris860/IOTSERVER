@@ -26,34 +26,38 @@ def root():
 async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
     username = websocket.headers.get("x-username")
     password = websocket.headers.get("x-password")
-    print(f"Authenticating Wemos. username={username}")
+    print(f"Authenticating Wemos. Received headers → username={username}, password={password}")
 
     if not username or not password:
         await websocket.close(code=4000)
         reason = "Missing authentication headers"
         print(f"Authentication failed: {reason}")
-        notify_server_a(deviceId, "REJECTED", {"reason": reason})
+        notify_server_a(deviceId, "REJECTED", {"reason": reason, "username": username, "password": password})
         return
 
     try:
-        resp = requests.post(WEMOS_AUTH_URL,
-                             data={"action": "wemos_auth",
-                                   "username": username,
-                                   "password": password},
-                             timeout=10)
+        resp = requests.post(
+            WEMOS_AUTH_URL,
+            data={"action": "wemos_auth", "username": username, "password": password},
+            timeout=10,
+        )
+        print(f"Backend replied HTTP {resp.status_code}: {resp.text}")  # show raw backend reply
+
         if resp.status_code != 200:
             reason = f"Backend error HTTP {resp.status_code}"
             await websocket.close(code=4001)
             print(f"Authentication failed: {reason}")
-            notify_server_a(deviceId, "REJECTED", {"reason": reason})
+            notify_server_a(deviceId, "REJECTED", {"reason": reason, "username": username})
             return
 
         data = resp.json()
+        print(f"Parsed backend JSON: {data}")  # show parsed JSON
+
         if not data.get("success"):
             reason = data.get("message", "Unknown rejection")
             await websocket.close(code=4002)
             print(f"Authentication failed: {reason}")
-            notify_server_a(deviceId, "REJECTED", {"reason": reason})
+            notify_server_a(deviceId, "REJECTED", {"reason": reason, "username": username})
             return
 
         # Device authenticated
@@ -63,7 +67,7 @@ async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
         await websocket.accept()
         devices[deviceName] = websocket
         last_ping[deviceName] = time.time()
-        print(f"Wemos '{deviceName}' authenticated and connected.")
+        print(f"Wemos '{deviceName}' authenticated and connected with username={username}")
 
         # Send initial command
         await websocket.send_text(json.dumps({"type": "command", "payload": {"action": initialCommand}}))
@@ -71,12 +75,12 @@ async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
         # Notify Server A
         notify_server_a(deviceName, "CONNECTED")
 
-        ...
+        # … rest of your loop …
     except Exception as e:
         reason = f"Internal error: {e}"
         print(f"Authentication error: {reason}")
         await websocket.close(code=1011)
-        notify_server_a(deviceId, "REJECTED", {"reason": reason})
+        notify_server_a(deviceId, "REJECTED", {"reason": reason, "username": username})
 
 @app.post("/command")
 async def receive_command(request: Request):
