@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import asyncio
+import requests
 from typing import Dict, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.responses import JSONResponse
@@ -13,13 +15,18 @@ devices: Dict[str, WebSocket] = {}
 browsers: Set[WebSocket] = set()
 last_ping: Dict[str, float] = {}
 
+PHP_BACKEND_URL = "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=is_current_time_in_period"
+@app.on_event("startup")
+async def start_php_polling():
+    asyncio.create_task(check_php_backend())
+
+
 @app.get("/")
 def root():
     return JSONResponse({"status": "ok", "message": "WebSocket gateway online"})
 
 @app.websocket("/ws/device")
 async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
-    """WebSocket endpoint for Wemos/IoT devices"""
     await websocket.accept()
     devices[deviceId] = websocket
     last_ping[deviceId] = time.time()
@@ -30,13 +37,11 @@ async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
             msg = await websocket.receive_text()
             data = json.loads(msg)
 
-            # Heartbeat
             if data.get("type") == "ping":
                 last_ping[deviceId] = time.time()
                 await websocket.send_text(json.dumps({"type": "pong"}))
                 continue
 
-            # Status update from device -> broadcast to browsers
             await notify_browsers({
                 "type": "device_status",
                 "deviceId": deviceId,
@@ -51,7 +56,6 @@ async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
 
 @app.websocket("/ws/browser")
 async def ws_browser(websocket: WebSocket):
-    """WebSocket endpoint for browser clients"""
     await websocket.accept()
     browsers.add(websocket)
     try:
@@ -59,7 +63,6 @@ async def ws_browser(websocket: WebSocket):
             msg = await websocket.receive_text()
             data = json.loads(msg)
 
-            # Browser sends command to device
             if data.get("type") == "command":
                 target = data.get("deviceId")
                 payload = data.get("payload", {})
@@ -84,16 +87,14 @@ async def ws_browser(websocket: WebSocket):
 
 @app.post("/command")
 async def receive_command(request: Request):
-    """Receive command from Server A and forward to devices"""
     data = await request.json()
     command = data.get("command")
     source = data.get("source", "unknown")
-    target = data.get("deviceId")  # optional
+    target = data.get("deviceId")
 
     print(f"[{time.strftime('%H:%M:%S')}] Received command from {source}: {command}")
 
     if target:
-        # Send only to the specified device
         ws = devices.get(target)
         if ws:
             try:
@@ -113,7 +114,6 @@ async def receive_command(request: Request):
         else:
             return { "status": "error", "message": f"Device {target} not connected." }
     else:
-        # Broadcast to all devices
         for deviceId, ws in devices.items():
             try:
                 await ws.send_text(json.dumps({
@@ -133,7 +133,6 @@ async def receive_command(request: Request):
         return { "status": "ok", "message": f"Command '{command}' broadcasted to all devices." }
 
 async def notify_browsers(event: dict):
-    """Broadcast events to all connected browsers"""
     dead = []
     message = json.dumps(event)
     for ws in list(browsers):
@@ -144,8 +143,38 @@ async def notify_browsers(event: dict):
     for ws in dead:
         browsers.discard(ws)
 
+# --- PHP backend polling task ---
+async def check_php_backend():
+    while True:
+        try:
+            resp = requests.get(PHP_BACKEND_URL, timeout=10)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    print(f"[{time.strftime('%H:%M:%S')}] Failed to parse backend response: {resp.text}")
+                    data = None
+
+                if data:
+                    if data.get("success") is True:
+                        print(f"[{time.strftime('%H:%M:%S')}] PHP backend success: {data.get('message')}")
+                    else:
+                        print(f"[{time.strftime('%H:%M:%S')}] PHP backend failure: {data.get('message')}")
+            else:
+                print(f"[{time.strftime('%H:%M:%S')}] PHP backend error: HTTP {resp.status_code}")
+        except Exception as e:
+            print(f"[{time.strftime('%H:%M:%S')}] check_php_backend error: {e}")
+
+        await asyncio.sleep(60)  # poll every minute
+
 # --- Local run block ---
 if __name__ == "__main__":
     import uvicorn
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(check_php_backend())
+
     port = int(os.environ.get("PORT", 5000))
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+
