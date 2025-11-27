@@ -9,90 +9,119 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-devices: Dict[str, WebSocket] = {}
-last_ping: Dict[str, float] = {}
+# Pools
+unauthenticated: Dict[str, WebSocket] = {}   # deviceId -> socket
+devices: Dict[str, WebSocket] = {}           # deviceName -> socket
+last_ping: Dict[str, float] = {}             # deviceName -> last ping time
 
+# Config
 WEMOS_AUTH_URL = "https://tristechhub.org.rw/projects/ATS/backend/main.php?action=wemos_auth"
 SERVER_A_CALLBACK_URL = os.environ.get("SERVER_A_CALLBACK_URL", "https://webserver-ft8c.onrender.com/notify/device-status")
-
 PING_TIMEOUT = 180  # 3 minutes
+AUTH_GRACE_PERIOD = 60  # 1 minute
 
 @app.get("/")
 def root():
     return JSONResponse({"status": "ok", "message": "Server B online"})
 
-
 @app.websocket("/ws/device")
 async def ws_device(websocket: WebSocket, deviceId: str = Query(...)):
-    username = websocket.headers.get("x-username")
-    password = websocket.headers.get("x-password")
-    print(f"Authenticating Wemos. Received headers → username={username}, password={password}")
+    await websocket.accept()
+    unauthenticated[deviceId] = websocket
+    print(f"Device {deviceId} connected, awaiting auth...")
 
-    if not username or not password:
-        await websocket.close(code=4000)
-        reason = "Missing authentication headers"
-        print(f"Authentication failed: {reason}")
-        notify_server_a(deviceId, "REJECTED", {"reason": reason, "username": username, "password": password})
-        return
+    auth_deadline = time.time() + AUTH_GRACE_PERIOD
+    deviceName = None
 
     try:
-        resp = requests.post(
-            WEMOS_AUTH_URL,
-            data={"action": "wemos_auth", "username": username, "password": password},
-            timeout=10,
-        )
-        print(f"Backend replied HTTP {resp.status_code}: {resp.text}")  # show raw backend reply
+        while True:
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
 
-        if resp.status_code != 200:
-            reason = f"Backend error HTTP {resp.status_code}"
-            await websocket.close(code=4001)
-            print(f"Authentication failed: {reason}")
-            notify_server_a(deviceId, "REJECTED", {"reason": reason, "username": username})
-            return
+            # --- Handle auth handshake ---
+            if data.get("type") == "auth":
+                username = data.get("username")
+                password = data.get("password")
+                print(f"Auth attempt from {deviceId}: {username}/{password}")
 
-        data = resp.json()
-        print(f"Parsed backend JSON: {data}")  # show parsed JSON
+                try:
+                    resp = requests.post(
+                        WEMOS_AUTH_URL,
+                        data={"action": "wemos_auth", "username": username, "password": password},
+                        timeout=10,
+                    )
+                    print(f"Backend replied HTTP {resp.status_code}: {resp.text}")
 
-        if not data.get("success"):
-            reason = data.get("message", "Unknown rejection")
-            await websocket.close(code=4002)
-            print(f"Authentication failed: {reason}")
-            notify_server_a(deviceId, "REJECTED", {"reason": reason, "username": username})
-            return
+                    if resp.status_code == 200:
+                        backend = resp.json()
+                        print(f"Parsed backend JSON: {backend}")
 
-        # Device authenticated
-        deviceName = data.get("data", {}).get("device_name", username)
-        initialCommand = "HARD_ON" if data.get("data", {}).get("hard_switch_enabled") else "HARD_OFF"
+                        if backend.get("success"):
+                            deviceName = backend["data"]["device_name"]
+                            unauthenticated.pop(deviceId, None)
+                            devices[deviceName] = websocket
+                            last_ping[deviceName] = time.time()
+                            print(f"Device {deviceName} authenticated")
 
-        await websocket.accept()
-        devices[deviceName] = websocket
-        last_ping[deviceName] = time.time()
-        print(f"Wemos '{deviceName}' authenticated and connected with username={username}")
+                            # Send initial status
+                            initialCommand = "HARD_ON" if backend["data"].get("hard_switch_enabled") else "HARD_OFF"
+                            await websocket.send_text(json.dumps({"type": "command", "payload": {"action": initialCommand}}))
+                            notify_server_a(deviceName, "CONNECTED")
+                        else:
+                            reason = backend.get("message", "Auth failed")
+                            await websocket.send_text(json.dumps({"type": "auth_failed", "reason": reason}))
+                            await websocket.close(code=4002)
+                            notify_server_a(deviceId, "REJECTED", {"reason": reason})
+                            return
+                    else:
+                        reason = f"Backend error HTTP {resp.status_code}"
+                        await websocket.send_text(json.dumps({"type": "auth_failed", "reason": reason}))
+                        await websocket.close(code=4001)
+                        notify_server_a(deviceId, "REJECTED", {"reason": reason})
+                        return
+                except Exception as e:
+                    reason = f"Internal error: {e}"
+                    await websocket.send_text(json.dumps({"type": "auth_failed", "reason": reason}))
+                    await websocket.close(code=1011)
+                    notify_server_a(deviceId, "REJECTED", {"reason": reason})
+                    return
 
-        # Send initial command
-        await websocket.send_text(json.dumps({"type": "command", "payload": {"action": initialCommand}}))
+            # --- Handle ping/pong ---
+            elif data.get("type") == "ping" and deviceName in devices:
+                last_ping[deviceName] = time.time()
+                await websocket.send_text(json.dumps({"type": "pong"}))
 
-        # Notify Server A
-        notify_server_a(deviceName, "CONNECTED")
+            # --- Forward status if authenticated ---
+            elif deviceName in devices and data.get("type") == "status":
+                notify_server_a(deviceName, "STATUS", payload=data)
 
-        # … rest of your loop …
-    except Exception as e:
-        reason = f"Internal error: {e}"
-        print(f"Authentication error: {reason}")
-        await websocket.close(code=1011)
-        notify_server_a(deviceId, "REJECTED", {"reason": reason, "username": username})
+            # --- Grace period timeout ---
+            if deviceId in unauthenticated and time.time() > auth_deadline:
+                await websocket.send_text(json.dumps({"type": "auth_failed", "reason": "Timeout: no auth within 60s"}))
+                await websocket.close(code=4003)
+                unauthenticated.pop(deviceId, None)
+                notify_server_a(deviceId, "REJECTED", {"reason": "Timeout"})
+                return
+
+    except WebSocketDisconnect:
+        print(f"Device {deviceId} disconnected")
+        unauthenticated.pop(deviceId, None)
+        if deviceName and deviceName in devices:
+            devices.pop(deviceName, None)
+            last_ping.pop(deviceName, None)
+            notify_server_a(deviceName, "DISCONNECTED")
 
 @app.post("/command")
 async def receive_command(request: Request):
     """Receive command from Server A and forward to devices"""
     data = await request.json()
     command = data.get("command")
-    target = data.get("deviceId")
+    target = data.get("deviceName")
 
     print(f"[{time.strftime('%H:%M:%S')}] Received command: {command} for {target}")
 
     if not target:
-        return {"status": "error", "message": "Missing deviceId"}
+        return {"status": "error", "message": "Missing deviceName"}
 
     if isinstance(target, list):
         results = {}
@@ -109,7 +138,6 @@ async def send_command_to_device(deviceName: str, command: str):
             await ws.send_text(json.dumps({"type": "command", "payload": {"action": command}}))
             return {"status": "ok", "message": f"Command '{command}' sent to {deviceName}."}
         except Exception as e:
-            # Clean up dead socket
             devices.pop(deviceName, None)
             last_ping.pop(deviceName, None)
             print(f"Socket for {deviceName} was closed. Removing from devices.")
