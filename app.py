@@ -116,7 +116,7 @@ async def receive_command(request: Request):
     """Receive command from Server A and forward to devices"""
     data = await request.json()
     command = data.get("command")
-    target = data.get("deviceName")
+    target =  target = data.get("deviceName") or data.get("deviceId")  # accept both
 
     print(f"[{time.strftime('%H:%M:%S')}] Received command: {command} for {target}")
 
